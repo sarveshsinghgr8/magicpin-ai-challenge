@@ -29,6 +29,7 @@ import time
 import json
 import uuid
 import re
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Optional
@@ -48,6 +49,24 @@ if ENV_PATH.exists():
 
 app = FastAPI(title="Vera AI Bot", version="2.0.0")
 START = time.time()
+
+# Self-ping to prevent Render free-tier sleep (pings /v1/healthz every 13 min)
+RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
+
+def _self_ping():
+    """Background thread that pings own healthz to prevent idle shutdown."""
+    import time as _time
+    while True:
+        _time.sleep(780)  # 13 minutes
+        if RENDER_URL:
+            try:
+                urlrequest.urlopen(f"{RENDER_URL}/v1/healthz", timeout=10)
+            except Exception:
+                pass
+
+if RENDER_URL:
+    _ping_thread = threading.Thread(target=_self_ping, daemon=True)
+    _ping_thread.start()
 
 # =============================================================================
 # CONFIGURATION — Set via environment variables
