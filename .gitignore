@@ -1,0 +1,22 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Test/helper scripts (not part of submission)
+test_llm.py
+test_endpoints.py
+check_rate.py
+preview.py
+
+# Challenge-provided files (not our code)
+challenge-brief.md
+challenge-testing-brief.md
+engagement-design.md
+engagement-research.md
+judge_simulator.py
+dataset/
+examples/
