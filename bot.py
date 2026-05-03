@@ -141,10 +141,11 @@ You are Vera, magicpin's merchant AI assistant. You compose WhatsApp messages.
 5. NO promotional/salesy language — peer tone.
 6. NO greetings like "Hope you're doing well" or filler.
 7. NO internal system terminology exposed to merchant.
-8. ALWAYS anchor on at least ONE verifiable fact (number, date, name, source).
+8. ALWAYS anchor on at least TWO verifiable facts from the context (numbers, dates, peer comparisons, sources). Include a merchant-vs-peer gap when peer_stats differ. If only ONE fact is available in the context, use that one — NEVER invent a second fact.
 9. MATCH language preference (hindi-english mix if indicated).
 10. If scope=customer → send_as MUST be "merchant_on_behalf".
 11. If scope=merchant → send_as MUST be "vera".
+12. ALWAYS end with effort externalization when offering work ("I'll draft X — ready in 5 min", "Live in 10 min").
 
 ## VOICE RULES BY CATEGORY
 | Category | Tone | Salutation | Key rules |
@@ -161,14 +162,19 @@ You are Vera, magicpin's merchant AI assistant. You compose WhatsApp messages.
 - multi_choice → Slot/option selection (Reply 1 for X, 2 for Y)
 - none → Pure information with no ask needed
 
-## COMPULSION LEVERS (use 1-3 per message)
+## COMPULSION LEVERS (use 2-3 per message, NEVER just 1)
 - Specificity: Real numbers/dates/sources from context
 - Loss aversion: What they're missing (-X% visibility, Y lapsed customers)
 - Curiosity: Tease useful information
-- Social proof: Peer stats, benchmarks
+- Social proof: Peer stats, benchmarks (MANDATORY when peer_stats provided — e.g., "your CTR 2.1% vs category avg 3.0%")
 - Reciprocity: "Want me to draft/pull/create..."
-- Effort externalization: "Takes 5 min", "Live in 10 min"
+- Effort externalization: "Takes 5 min", "Live in 10 min" (MANDATORY when offering to do work)
 - Single-binary CTA: Make responding trivially easy
+
+## MANDATORY LEVER RULES
+- ALWAYS use Social Proof when peer_stats show a gap (merchant metric < peer avg)
+- ALWAYS use Loss Aversion when customer_aggregate shows lapsed customers (e.g., "78 patients haven't returned in 6mo")
+- ALWAYS end with Effort Externalization when offering a deliverable (draft, checklist, post)
 
 ## HINDI-ENGLISH CODE-MIX (when language_pref includes "hi")
 - Mix naturally: "Apke liye 2 slots ready hain"
@@ -229,7 +235,7 @@ Context: Ramesh, Apollo Pharmacy, atorvastatin recall, batches AT2024-1102/1108,
 
 REPLY_GUIDE = """# VERA REPLY HANDLER — STRICT RULES
 
-You handle a merchant's reply in an ongoing WhatsApp conversation.
+You handle a merchant's or customer's reply in an ongoing WhatsApp conversation.
 
 ## OUTPUT FORMAT — MANDATORY JSON ONLY
 Choose ONE action:
@@ -243,6 +249,13 @@ Choose ONE action:
 ### END (close conversation)
 {"action": "end", "body": "<optional farewell, max 100 chars or empty>", "rationale": "<reason>"}
 
+## VERA'S CAPABILITIES (NEVER claim actions outside this list)
+Vera CAN: draft messages, pull data, create checklists, filter customer lists, suggest content, share information
+Vera CANNOT: book appointments, process payments, access external systems, confirm reservations, make calls
+- For booking/slot requests: "Noted — [slot details]. The team will confirm your booking shortly."
+- For action requests: "On it — I'll [specific deliverable] and share here in [X] min."
+- NEVER say "I have booked" / "Done, confirmed" / "Your appointment is set" — Vera is an assistant, not a booking system.
+
 ## DETECTION PRIORITY (apply in order):
 
 1. AUTO-REPLY: "thank you for contacting" / "our team will respond" / generic automated text
@@ -251,10 +264,21 @@ Choose ONE action:
 2. HOSTILE: "stop" / "spam" / "useless" / "block" / "leave me alone"
    → end with brief apology. NEVER argue.
 
-3. COMMITMENT: "yes" / "let's do it" / "go ahead" / "sure" / "proceed"
+3. COMMITMENT / ACTION REQUEST: "yes" / "let's do it" / "go ahead" / "sure" / "book me" / "please do X"
    → send. Switch to ACTION mode immediately.
-   → Body = confirmation + what happens next + timeline.
+   → Body = acknowledgment + what YOU will do next + timeline.
    → NEVER ask qualifying questions after commitment.
+   → NEVER fabricate completed actions.
+
+   CORRECT examples:
+   - Merchant says "yes, draft it": {"action":"send","body":"On it. I'll draft the checklist based on DCI's new limits — sharing here in 5 min for your review.","rationale":"Commitment detected. Action mode."}
+   - Customer says "book me for Wed 6pm": {"action":"send","body":"Noted — Wed 6pm slot. The clinic team will confirm your booking shortly.","rationale":"Booking request. Acknowledged without fabricating confirmation."}
+   - Merchant says "go ahead": {"action":"send","body":"Done — working on it now. Will share the draft here in 5 min for approval.","rationale":"Commitment. Action mode with timeline."}
+
+   WRONG (NEVER do this):
+   - "To get started, could you tell me..." ← qualifying after commitment
+   - "I have booked your appointment" ← fabricating an action Vera cannot do
+   - "Great! What time works?" ← re-qualifying when slot was already given
 
 4. QUESTION: contains "?"
    → send. Answer using available context. If not available: "Let me check and get back."
@@ -266,8 +290,9 @@ Choose ONE action:
 - MAX 300 chars in reply body
 - NEVER re-pitch after hostility
 - NEVER qualify after commitment
-- NEVER fabricate
+- NEVER fabricate completed actions (bookings, payments, confirmations)
 - After turn 5: lean toward end
+- When customer picks a slot/option: acknowledge the choice + say team will confirm
 """
 
 # =============================================================================
@@ -478,6 +503,23 @@ class VeraComposer:
         ref_id = payload.get("top_item_id") or payload.get("digest_item_id") or payload.get("alert_id") or ""
         relevant_digest = next((d for d in digest if d.get("id") == ref_id), None)
 
+        # Pre-compute social proof gaps for the LLM
+        peer_ctr = peer_stats.get('avg_ctr')
+        merchant_ctr = perf.get('ctr')
+        ctr_gap = ""
+        if peer_ctr and merchant_ctr and isinstance(peer_ctr, (int, float)) and isinstance(merchant_ctr, (int, float)):
+            gap_pp = round((merchant_ctr - peer_ctr) * 100, 1)
+            ctr_gap = f"CTR gap: merchant {merchant_ctr} vs peer avg {peer_ctr} ({gap_pp:+}pp)"
+
+        peer_views = peer_stats.get('avg_views_30d')
+        merchant_views = perf.get('views')
+        views_gap = ""
+        if peer_views and merchant_views and isinstance(peer_views, (int, float)) and isinstance(merchant_views, (int, float)):
+            views_gap = f"Views gap: merchant {merchant_views} vs peer avg {peer_views} ({merchant_views - peer_views:+})"
+
+        lapsed_count = cust_agg.get('lapsed_180d', 0) or cust_agg.get('lapsed', 0)
+        active_count = cust_agg.get('active', 0)
+
         prompt = f"""## COMPOSE A MESSAGE FOR THIS CONTEXT
 
 ### CATEGORY: {category.get('slug', 'unknown')}
@@ -501,6 +543,12 @@ class VeraComposer:
 - Customer aggregate: {json.dumps(cust_agg, ensure_ascii=False)}
 - Review themes: {json.dumps(review_themes[:3], ensure_ascii=False)}
 - Last conversation: {json.dumps(conv_history[-2:], ensure_ascii=False)[:300]}
+
+### SOCIAL PROOF ANCHORS (USE these in the message when relevant)
+{f'- {ctr_gap}' if ctr_gap else '- No CTR gap data'}
+{f'- {views_gap}' if views_gap else '- No views gap data'}
+{f'- Lapsed customers: {lapsed_count} (use for loss aversion)' if lapsed_count else '- No lapsed data'}
+{f'- Active customers: {active_count}' if active_count else ''}
 
 ### TRIGGER
 - Kind: {trigger.get('kind', '?')}
@@ -694,14 +742,20 @@ class ConversationHandler:
                     "body": "Understood — won't message again unless you reach out. Apologies for the inconvenience.",
                     "rationale": "Hostile detected. Graceful exit."}
 
-        # 3. Commitment → action mode
-        if any(c in msg for c in self.COMMIT):
+        # 3. Commitment → action mode (use stricter action-mode prompt)
+        if any(c in msg for c in self.COMMIT) or self._is_slot_pick(msg):
             if llm.available:
-                result = self._llm_reply(conversation_id, merchant_id, message)
+                result = self._llm_reply_action(conversation_id, merchant_id, message)
                 if result:
                     return result
+            # Detect if it's a booking/slot pick
+            if self._is_slot_pick(msg):
+                return {"action": "send",
+                        "body": "Noted — your preferred slot has been shared with the team. They'll confirm shortly.",
+                        "cta": None,
+                        "rationale": "Slot pick detected. Acknowledged without fabricating booking."}
             return {"action": "send",
-                    "body": "Done — working on it now. I'll share the draft here in 5 minutes for your approval.",
+                    "body": "On it — I'll prepare this and share here in 5 min for your review.",
                     "cta": None,
                     "rationale": "Commitment detected. Action mode."}
 
@@ -754,6 +808,69 @@ Respond following the Reply Handler Guide. ONLY JSON."""
             except json.JSONDecodeError:
                 return None
         return result if "action" in result else None
+
+    def _llm_reply_action(self, conversation_id: str, merchant_id: str, message: str) -> Optional[dict]:
+        """Stricter action-mode prompt that prevents qualifying and fabrication."""
+        history = conversations.get(conversation_id, [])
+        merchant = get_merchant(merchant_id)
+        hist_text = "\n".join(
+            f"  Turn {t['turn']} ({t['from']}): {t['message'][:100]}"
+            for t in history[-5:])
+
+        action_prompt = f"""## CONTEXT
+Merchant: {merchant.get('identity', {}).get('name', '?')} ({merchant.get('identity', {}).get('owner_first_name', '?')})
+Category: {merchant.get('category_slug', '?')}
+Turn: {len(history)}
+
+## HISTORY
+{hist_text}
+
+## LATEST MESSAGE (COMMITMENT/ACTION REQUEST)
+"{message}"
+
+## INSTRUCTIONS — ACTION MODE
+The user has committed or requested an action. Respond with ACTION confirmation.
+- Say what YOU will do next + give a timeline
+- If they picked a slot/time: acknowledge it + say "team will confirm"
+- NEVER ask qualifying questions
+- NEVER say "I have booked" or "confirmed" — Vera cannot book/transact
+- Keep under 300 chars
+
+Return ONLY: {{"action": "send", "body": "<your reply>", "cta": null, "rationale": "<reason>"}}"""
+
+        response = llm.complete(REPLY_GUIDE, action_prompt)
+        if not response:
+            return None
+        try:
+            result = json.loads(response)
+        except json.JSONDecodeError:
+            match = re.search(r'\{[\s\S]*?\}', response)
+            if not match:
+                return None
+            try:
+                result = json.loads(match.group())
+            except json.JSONDecodeError:
+                return None
+        if not result or "action" not in result:
+            return None
+        # Safety check: strip fabricated booking confirmations
+        body = result.get("body", "")
+        fabrication_phrases = ["i have booked", "appointment is confirmed", "booking confirmed",
+                               "your appointment is set", "reservation confirmed"]
+        if any(p in body.lower() for p in fabrication_phrases):
+            result["body"] = "Noted — your preference is recorded. The team will confirm shortly."
+        return result
+
+    @staticmethod
+    def _is_slot_pick(msg: str) -> bool:
+        """Detect if message is a slot/time selection."""
+        slot_patterns = [
+            r'\b(book|slot|wed|thu|fri|sat|sun|mon|tue)\b.*\d',
+            r'\breply\s*[12]\b', r'^\s*[12]\s*$',
+            r'\b\d{1,2}\s*(am|pm)\b',
+            r'\bbook\s+me\b', r'\bplease\s+book\b',
+        ]
+        return any(re.search(p, msg, re.IGNORECASE) for p in slot_patterns)
 
 
 conversation_handler = ConversationHandler()
