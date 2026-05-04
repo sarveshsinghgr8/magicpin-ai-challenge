@@ -78,7 +78,8 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 _openrouter_base = os.environ.get("OPENROUTER_URL", "https://openrouter.ai/api/v1")
 OPENROUTER_URL = _openrouter_base.rstrip("/") + "/chat/completions" if not _openrouter_base.endswith("/chat/completions") else _openrouter_base
-LLM_TIMEOUT = 45  # seconds — generous for free-tier models
+LLM_TIMEOUT = 25  # seconds — must be under judge's 30s timeout
+LLM_RETRIES = 2   # retry transient 503/429 errors
 
 # =============================================================================
 # IN-MEMORY STORES
@@ -325,23 +326,35 @@ class LLMClient:
         }.get(self.provider, "gpt-4o-mini")
 
     def complete(self, system: str, user_prompt: str) -> Optional[str]:
-        """Call LLM. Returns response text or None on failure."""
+        """Call LLM with retry for transient errors. Returns response text or None."""
         if not self.available:
             return None
-        try:
-            dispatch = {
-                "openai": self._call_openai,
-                "gemini": self._call_gemini,
-                "groq": self._call_groq,
-                "ollama": self._call_ollama,
-                "deepseek": self._call_deepseek,
-                "openrouter": self._call_openrouter,
-            }
-            fn = dispatch.get(self.provider)
-            return fn(system, user_prompt) if fn else None
-        except Exception as e:
-            print(f"[LLM ERROR] {self.provider}: {e}")
+        dispatch = {
+            "openai": self._call_openai,
+            "gemini": self._call_gemini,
+            "groq": self._call_groq,
+            "ollama": self._call_ollama,
+            "deepseek": self._call_deepseek,
+            "openrouter": self._call_openrouter,
+        }
+        fn = dispatch.get(self.provider)
+        if not fn:
             return None
+        for attempt in range(1, LLM_RETRIES + 2):  # 1 try + LLM_RETRIES retries
+            try:
+                return fn(system, user_prompt)
+            except Exception as e:
+                err_str = str(e)
+                retryable = any(code in err_str for code in ["503", "429", "500", "502"])
+                if retryable and attempt <= LLM_RETRIES:
+                    import time
+                    wait = attempt * 1.0  # 1s, 2s backoff
+                    print(f"[LLM RETRY] {self.provider}: {e} — retry {attempt}/{LLM_RETRIES} in {wait}s")
+                    time.sleep(wait)
+                else:
+                    print(f"[LLM ERROR] {self.provider}: {e}")
+                    return None
+        return None
 
     def _call_openai(self, system: str, user_prompt: str) -> str:
         body = json.dumps({
@@ -468,9 +481,9 @@ class VeraComposer:
     """Composes messages: LLM + COMPOSITION_GUIDE → structured JSON output."""
 
     def compose(self, category: dict, merchant: dict, trigger: dict,
-                customer: Optional[dict] = None) -> dict:
+                customer: Optional[dict] = None, now: str = "") -> dict:
         """Build context prompt → call LLM → parse. Falls back to rules if LLM fails."""
-        user_prompt = self._build_prompt(category, merchant, trigger, customer)
+        user_prompt = self._build_prompt(category, merchant, trigger, customer, now)
 
         # Primary: LLM with guide
         if llm.available:
@@ -480,11 +493,12 @@ class VeraComposer:
                 result["suppression_key"] = trigger.get("suppression_key", "")
                 return result
 
-        # Fallback: rule-based
-        return self._fallback(category, merchant, trigger, customer)
+        # LLM failed after retries — return None so tick returns empty actions
+        # (empty is better than a low-quality fallback that drags down averages)
+        return None
 
     def _build_prompt(self, category: dict, merchant: dict, trigger: dict,
-                      customer: Optional[dict]) -> str:
+                      customer: Optional[dict], now: str = "") -> str:
         """Build structured context for the LLM (the 'retrieved data')."""
         voice = category.get("voice", {})
         peer_stats = category.get("peer_stats", {})
@@ -521,6 +535,8 @@ class VeraComposer:
         active_count = cust_agg.get('active', 0)
 
         prompt = f"""## COMPOSE A MESSAGE FOR THIS CONTEXT
+
+### CURRENT TIME: {now or 'unknown'}
 
 ### CATEGORY: {category.get('slug', 'unknown')}
 - Voice: {voice.get('tone', '?')} / {voice.get('register', '?')}
@@ -894,9 +910,11 @@ async def healthz():
 async def metadata():
     return {
         "team_name": "Vera Enhanced",
-        "team_members": ["AI Engineer"],
+        "team_members": ["Sarvesh Singh"],
         "model": f"{llm.provider}/{llm.model}" if llm.available else "rule-based-fallback",
         "approach": "LLM-guided composition with strict Composition Guide (temp=0, seed=42). Deterministic. RAG-grounded on pushed contexts only.",
+        "contact_email": "sarvesh.05.nagpur@gmail.com",
+        "version": "2.1.0",
         "submitted_at": datetime.utcnow().isoformat() + "Z"
     }
 
@@ -912,13 +930,9 @@ async def push_context(body: ContextBody):
     key = (body.scope, body.context_id)
     if key in contexts:
         existing = contexts[key]["version"]
-        if body.version < existing:
+        if body.version <= existing:
             return {"accepted": False, "reason": "stale_version",
                     "current_version": existing}
-        if body.version == existing:
-            return {"accepted": True,
-                    "ack_id": f"ack_{body.context_id}_{body.version}",
-                    "stored_at": datetime.utcnow().isoformat() + "Z"}
 
     contexts[key] = {"version": body.version, "payload": body.payload,
                      "delivered_at": body.delivered_at}
@@ -941,7 +955,7 @@ async def tick(body: TickBody):
         category = get_category_for_merchant(merchant)
         customer = get_customer(customer_id) if customer_id else None
 
-        result = composer.compose(category, merchant, trigger, customer)
+        result = composer.compose(category, merchant, trigger, customer, now=body.now)
         if result and result.get("body"):
             conv_id = f"conv_{trigger_id}_{uuid.uuid4().hex[:8]}"
             actions.append({
@@ -976,5 +990,5 @@ async def reply(body: ReplyBody):
 
 
 def compose(category: dict, merchant: dict, trigger: dict,
-            customer: dict | None = None) -> dict:
-    return composer.compose(category, merchant, trigger, customer)
+            customer: dict | None = None, now: str = "") -> dict:
+    return composer.compose(category, merchant, trigger, customer, now=now)
