@@ -331,7 +331,7 @@ class LLMClient:
             return None
         dispatch = {
             "openai": self._call_openai,
-            "gemini": self._call_gemini,
+            "gemini": self._call_gemini"gemini": self._call_gemini,
             "groq": self._call_groq,
             "ollama": self._call_ollama,
             "deepseek": self._call_deepseek,
@@ -623,96 +623,6 @@ class VeraComposer:
             "rationale": result.get("rationale", "")
         }
 
-    def _fallback(self, category: dict, merchant: dict, trigger: dict,
-                  customer: Optional[dict]) -> dict:
-        """Deterministic rule-based fallback."""
-        owner = merchant.get("identity", {}).get("owner_first_name", "there")
-        cat_slug = category.get("slug", "")
-        kind = trigger.get("kind", "update")
-        payload = trigger.get("payload", {})
-        salutation = f"Dr. {owner}" if cat_slug == "dentists" else f"Hi {owner}"
-
-        # Customer-facing
-        if customer:
-            cust_name = customer.get("identity", {}).get("name", "there")
-            merchant_name = merchant.get("identity", {}).get("name", "")
-            body = f"Hi {cust_name}, {merchant_name} here. "
-            if kind == "recall_due":
-                slots = payload.get("available_slots", [])
-                slot_text = " or ".join(s.get("label", "") for s in slots[:2])
-                body += f"Your {payload.get('service_due', 'checkup').replace('_', ' ')} is due. Available: {slot_text}. Reply to book."
-            elif kind == "customer_lapsed_hard":
-                weeks = payload.get("days_since_last_visit", 30) // 7
-                body += f"It's been {weeks} weeks — no pressure. Reply YES for a free trial spot."
-            elif kind == "chronic_refill_due":
-                meds = ", ".join(payload.get("molecule_list", [])[:3])
-                body += f"Your refill for {meds} is due. Reply OK to confirm."
-            elif kind == "wedding_package_followup":
-                days = payload.get("days_to_wedding", 0)
-                body += f"💍 {days} days to your wedding! Perfect time to start skin-prep. Want to book?"
-            elif kind == "trial_followup":
-                sessions = payload.get("next_session_options", [])
-                slot = sessions[0].get("label", "this week") if sessions else "soon"
-                body += f"Enjoyed the trial? Next session: {slot}. Reply YES to book."
-            else:
-                body += "Quick update — reply if you'd like to know more."
-            return {"body": body.strip(), "cta": "binary_yes_no",
-                    "send_as": "merchant_on_behalf",
-                    "suppression_key": trigger.get("suppression_key", ""),
-                    "rationale": f"Fallback: {kind} (customer-facing)"}
-
-        # Merchant-facing
-        digest = category.get("digest", [])
-        ref_id = payload.get("top_item_id") or payload.get("digest_item_id") or ""
-        digest_item = next((d for d in digest if d.get("id") == ref_id), None)
-        body = f"{salutation}, "
-
-        if kind == "research_digest" and digest_item:
-            body += f"{digest_item.get('source', 'New research')} — {digest_item.get('title', '')}. Want me to pull the details?"
-        elif kind == "regulation_change" and digest_item:
-            body += f"Compliance: {digest_item.get('title', '')}. Deadline: {payload.get('deadline_iso', '')[:10]}. Want a checklist?"
-        elif kind == "perf_dip":
-            body += f"your {payload.get('metric', 'views')} dropped {abs(int(payload.get('delta_pct', 0)*100))}% this week. Want me to diagnose?"
-        elif kind == "seasonal_perf_dip":
-            body += f"views down {abs(int(payload.get('delta_pct', 0)*100))}% — normal seasonal dip. Focus retention. Want a plan?"
-        elif kind == "perf_spike":
-            body += f"nice — {payload.get('metric', 'views')} up {int(payload.get('delta_pct', 0)*100)}%! Want me to amplify?"
-        elif kind == "renewal_due":
-            body += f"plan expires in {payload.get('days_remaining', 0)} days. Reply YES to renew."
-        elif kind == "ipl_match_today":
-            body += f"{payload.get('match', 'IPL')} tonight. Sat matches = -12% covers. Push delivery. Want me to draft?"
-        elif kind == "supply_alert":
-            body += f"URGENT — {payload.get('molecule', '')} recall, batches {'+'.join(payload.get('affected_batches', [])[:2])}. Pull stock. Want affected customer list?"
-        elif kind == "active_planning_intent":
-            body += f"here's a draft for {payload.get('intent_topic', '').replace('_', ' ')}. Want me to refine?"
-        elif kind == "curious_ask_due":
-            body += f"Quick check — what's most in-demand this week? I'll make it into a Google post."
-        elif kind == "review_theme_emerged":
-            body += f'review pattern: "{payload.get("theme", "").replace("_", " ")}" ({payload.get("occurrences_30d", 0)}x). Want me to draft replies?'
-        elif kind == "milestone_reached":
-            body += f"you're at {payload.get('value_now', 0)} {payload.get('metric', '').replace('_', ' ')} — {payload.get('milestone_value', 0) - payload.get('value_now', 0)} from milestone! Want a post ready?"
-        elif kind == "competitor_opened":
-            body += f"{payload.get('competitor_name', 'competitor')} opened {payload.get('distance_km', 0)}km away. Want to see their profile?"
-        elif kind == "winback_eligible":
-            body += f"it's been {payload.get('days_since_expiry', 0)} days. Visibility down {abs(int(payload.get('perf_dip_pct', 0)*100))}%. Reply SHOW for comparison."
-        elif kind == "gbp_unverified":
-            body += f"GBP not verified — missing ~{int(payload.get('estimated_uplift_pct', 0)*100)}% of searches. 5-min fix. Want to do it now?"
-        elif kind == "cde_opportunity" and digest_item:
-            body += f"CDE tonight: {digest_item.get('title', '')}. {digest_item.get('credits', 0)} credits."
-        elif kind == "dormant_with_vera":
-            body += f"been {payload.get('days_since_last_merchant_message', 0)} days — anything I can help with? Even a quick review reply takes 2 min."
-        elif kind == "category_seasonal":
-            trends = payload.get("trends", [])[:3]
-            body += f"seasonal shift: {', '.join(t.replace('_demand_', ' ').replace('+','↑').replace('-','↓') for t in trends)}. Want a customer broadcast?"
-        elif kind == "festival_upcoming":
-            body += f"{payload.get('festival', '')} in {payload.get('days_until', 0)} days. Want themed content?"
-        else:
-            body += f"update on {kind.replace('_', ' ')}. Want help acting on it?"
-
-        return {"body": body.strip(), "cta": "open_ended", "send_as": "vera",
-                "suppression_key": trigger.get("suppression_key", ""),
-                "rationale": f"Fallback: {kind}"}
-
 
 # Initialize composer
 composer = VeraComposer()
@@ -781,14 +691,8 @@ class ConversationHandler:
             if result:
                 return result
 
-        # 5. Fallback
-        if "?" in message:
-            return {"action": "send",
-                    "body": "Good question — let me check and get back to you shortly.",
-                    "cta": None, "rationale": "Question detected."}
-        return {"action": "send",
-                "body": "Got it, thanks. Anything else I can help with?",
-                "cta": None, "rationale": "Default acknowledgment."}
+        # 5. LLM failed — return empty acknowledgment
+        return {"action": "send", "body": "", "cta": None, "rationale": "LLM unavailable."}
 
     def _llm_reply(self, conversation_id: str, merchant_id: str, message: str) -> Optional[dict]:
         history = conversations.get(conversation_id, [])
