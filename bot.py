@@ -331,7 +331,7 @@ class LLMClient:
             return None
         dispatch = {
             "openai": self._call_openai,
-            "gemini": self._call_gemini"gemini": self._call_gemini,
+            "gemini": self._call_gemini,
             "groq": self._call_groq,
             "ollama": self._call_ollama,
             "deepseek": self._call_deepseek,
